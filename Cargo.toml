@@ -1,0 +1,28 @@
+[package]
+name = "watch-kit"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80"
+authors = ["Sean Shaffer"]
+description = "Folder change and cache coordinator behind a small C ABI: coalesced change events and self-invalidating folder caches"
+license = "MIT"
+repository = "https://github.com/SeanShaffer88/WatchKit"
+keywords = ["windows", "ffi"]
+categories = ["os::windows-apis", "api-bindings"]
+
+[lib]
+name = "watch_kit"
+crate-type = ["cdylib", "rlib", "staticlib"]
+
+# Zero dependencies by default. Win32 bindings are hand-declared in
+# src/platform.rs with explicit #[link(name = "...")] on every extern
+# block (advapi32 / shell32 / kernel32 / user32 as needed). Adding a
+# dependency requires a written justification in the PR.
+[dependencies]
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"

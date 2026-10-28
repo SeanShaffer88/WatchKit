@@ -1,0 +1,25 @@
+# Canonical CI for Sean's Rust Windows projects — copy to
+# .github/workflows/ci.yml. NOTE: the GitHub App cannot create/edit files
+# under .github/workflows/ (no Workflows permission), so this file is
+# always added through the GitHub web UI.
+#
+# Steps mirror tools/gate.sh exactly, plus the one thing a local gate on
+# Linux cannot do: really LINK and RUN on Windows (LNK2019-class errors
+# and Windows-only test failures only appear here).
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+jobs:
+  gate:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test --locked
+      - run: cargo build --release --locked
