@@ -10,13 +10,29 @@
  *   printf("%s\n", s); wa_free_string(s);   // events JSON
  *   wa_close(w);                            // joins thread
  *
- * HOW IT WORKS IN v0.1. The engine POLLS: it snapshots
- * every root recursively (path -> size + mtime) and diffs
- * successive snapshots. That is deliberately portable —
- * the same code runs on every platform — and the
- * coalescing and cache contracts below are the product.
- * A ReadDirectoryChangesW backend is roadmap; it will
- * feed the same queue and cache, not replace them.
+ * HOW IT WORKS. Two backends discover raw changes; the
+ * coalescing and cache contracts below are the product
+ * and are IDENTICAL under both — the backend only
+ * changes how a change is noticed, never what it means.
+ *
+ *   polling (the portable core): a background thread
+ *   snapshots every root recursively (path -> size +
+ *   mtime) and diffs successive snapshots. The same code
+ *   runs on every platform, and wa_scan_once drives it
+ *   synchronously.
+ *
+ *   native (Windows, v0.2): one thread per watcher runs
+ *   ReadDirectoryChangesW over every root and stats each
+ *   path the OS names into the same snapshot, where the
+ *   ordinary diff/coalesce/invalidation pipeline takes
+ *   over. If the OS change buffer overflows (or a
+ *   completion is malformed), that root is rescanned
+ *   through the polling machinery, so an overflow costs
+ *   one walk, not lost changes. If the native backend
+ *   cannot start — or dies unexpectedly — polling takes
+ *   over and wa_status says "polling": the kit never
+ *   reports a backend that is not running.
+ *
  * Change detection is size + mtime (content is never
  * hashed): an edit that keeps the exact same size inside
  * one mtime tick can be missed. Files that already exist
@@ -26,7 +42,7 @@
  * CONFIG (one JSON object):
  *
  *   {"roots": ["/data", "/more"], "poll_interval_ms": 250,
- *    "ignore": ["*.tmp", ".git/**"],
+ *    "backend": "auto", "ignore": ["*.tmp", ".git/**"],
  *    "max_queue": 4096, "max_cache_entries": 256}
  *
  *   roots              (array of strings, required,
@@ -40,7 +56,20 @@
  *                      background thread: manual mode,
  *                      where scans happen only via
  *                      wa_scan_once (deterministic; what
- *                      tests use).
+ *                      tests use). Manual mode reports
+ *                      backend "polling" whatever backend
+ *                      says — there is no background
+ *                      discovery to be native.
+ *   backend            (string, default "auto") which
+ *                      change-discovery backend to run:
+ *                      "auto" = native on Windows,
+ *                      polling elsewhere; "native" =
+ *                      native, falling back to polling
+ *                      when it cannot start; "polling" =
+ *                      always the polling engine. Any
+ *                      other value is WA_ERR_INVALID_ARG.
+ *                      wa_status reports the backend that
+ *                      is ACTUALLY running.
  *   ignore             (array of strings, default [])
  *                      glob patterns; matching files are
  *                      never tracked and matching folders
@@ -149,12 +178,16 @@
  *
  * STATUS. wa_status returns:
  *
- *   {"roots":[...],"poll_interval_ms":N,
+ *   {"roots":[...],"poll_interval_ms":N,"backend":"...",
  *    "files_tracked":N,"events_emitted":N,"queue_len":N,
  *    "dropped":N,"next_seq":N,"scans":N,
  *    "cache_entries":N,"cache_hits":N,"cache_misses":N,
  *    "invalidations":N}
  *
+ *   backend         "native" or "polling": the backend
+ *                   actually running, which may differ
+ *                   from the requested one when a native
+ *                   request fell back (see CONFIG).
  *   files_tracked   entries in the current snapshot
  *                   (files + subfolders, roots excluded).
  *   events_emitted  distinct events ever queued (seqs
@@ -169,11 +202,14 @@
  * that scan. wa_scan_once runs one scan synchronously on
  * the caller's thread (background and manual scans are
  * serialized, so snapshots never apply out of order).
+ * Under the native backend, wa_scan_once still works —
+ * it is the same full polling diff — and native batches
+ * apply under the same serialization.
  *
- * wa_close(w) signals the background thread and JOINS
- * it before returning: a handle never leaks a thread.
- * NULL is a no-op. Anything through the handle after
- * wa_close is use-after-close.
+ * wa_close(w) signals the background thread (polling or
+ * native) and JOINS it before returning: a handle never
+ * leaks a thread. NULL is a no-op. Anything through the
+ * handle after wa_close is use-after-close.
  *
  * THREADING. The handle is thread-safe; every call is
  * serialized inside, and polls, status and cache queries
@@ -220,7 +256,8 @@ WA_API void wa_free_string(char *p);
 
 /* Create a watcher from a config JSON object (see
  * above). Builds the baseline snapshot synchronously
- * and starts the background polling thread unless
+ * and starts the background thread — polling or native,
+ * per the config's "backend" key — unless
  * poll_interval_ms is 0. Returns WA_OK and a handle in
  * *out_watcher, or a WA_ERR_* code and *out_watcher is
  * NULL. */
@@ -248,12 +285,12 @@ WA_API int wa_folder_size(WaWatcher *watcher, const char *path,
 WA_API int wa_cached_search(WaWatcher *watcher, const char *root,
                             const char *substring, char **out_json);
 
-/* Counters and cache statistics as one JSON object
- * (caller-owned). Shape: see above. */
+/* Counters, the running backend, and cache statistics
+ * as one JSON object (caller-owned). Shape: see above. */
 WA_API int wa_status(WaWatcher *watcher, char **out_json);
 
 /* Close and free the handle, JOINING the background
- * thread first. NULL is a no-op. */
+ * thread (polling or native) first. NULL is a no-op. */
 WA_API void wa_close(WaWatcher *watcher);
 
 #ifdef __cplusplus
