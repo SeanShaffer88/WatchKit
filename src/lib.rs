@@ -40,18 +40,24 @@
 //! - **No leaked thread.** `wa_close` signals the polling
 //!   thread and joins it before returning.
 //!
-//! The engine is pure `std::fs` polling — portable and
+//! The portable core is pure `std::fs` polling —
 //! deterministic (`wa_scan_once` drives it synchronously
-//! in tests). A native `ReadDirectoryChangesW` backend is
-//! roadmap; the coalescing and cache contracts above are
-//! the product and will not change under it.
+//! in tests). Since v0.2 a native `ReadDirectoryChangesW`
+//! backend (Windows, `src/platform.rs`) can discover raw
+//! changes instead; it feeds the SAME snapshot/queue/cache
+//! pipeline through `apply_observed_changes`, so the
+//! coalescing and cache contracts above are the product
+//! and do not change under it. Polling stays the fallback
+//! (and what runs everywhere else); `wa_status` reports
+//! which backend is actually running.
 
 pub mod ffi;
 pub mod json;
+pub mod platform;
 
-pub const VERSION: &str = "0.1.0";
+pub const VERSION: &str = "0.2.0";
 pub const VERSION_MAJOR: u32 = 0;
-pub const VERSION_MINOR: u32 = 1;
+pub const VERSION_MINOR: u32 = 2;
 pub const VERSION_PATCH: u32 = 0;
 
 // Error codes (mirror include/watchkit.h).
@@ -85,7 +91,7 @@ pub fn json_escape(s: &str) -> String {
     out
 }
 
-fn lock<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+pub(crate) fn lock<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     // A poisoned lock means a panic happened while holding
     // it; the watcher state is still structurally valid,
     // so recover the guard rather than wedging every call.
@@ -100,6 +106,38 @@ pub const DEFAULT_POLL_INTERVAL_MS: u64 = 500;
 pub const DEFAULT_MAX_QUEUE: usize = 4096;
 pub const DEFAULT_MAX_CACHE_ENTRIES: usize = 256;
 
+/// Which change-discovery backend a config asks for.
+/// The choice is a *request*: `wa_status` reports the
+/// backend that is actually running, and a native request
+/// that cannot start falls back to polling (and says so).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Backend {
+    /// Native where available (Windows), polling elsewhere.
+    Auto,
+    /// Native (`ReadDirectoryChangesW`) — Windows only;
+    /// falls back to polling when it cannot start.
+    Native,
+    /// The portable polling snapshot-diff engine.
+    Polling,
+}
+
+/// The backend a watcher is actually running. Reported by
+/// `wa_status` as `"native"` or `"polling"`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RunningBackend {
+    Native,
+    Polling,
+}
+
+impl RunningBackend {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            RunningBackend::Native => "native",
+            RunningBackend::Polling => "polling",
+        }
+    }
+}
+
 /// A fully-validated watcher configuration.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Config {
@@ -108,7 +146,12 @@ pub struct Config {
     /// Background poll interval. 0 disables the background
     /// thread (manual mode: scans happen only via
     /// `scan_once` — the deterministic test configuration).
+    /// Manual mode also means the polling driver is what
+    /// runs, whatever `backend` says: there is no
+    /// background discovery to be native.
     pub poll_interval_ms: u64,
+    /// Requested change-discovery backend (default Auto).
+    pub backend: Backend,
     /// Ignore glob patterns (see `glob_match`).
     pub ignore: Vec<String>,
     /// Pending-event queue bound (>= 1).
@@ -120,6 +163,7 @@ pub struct Config {
 /// Parse and validate a `wa_create` config JSON object:
 ///
 ///   {"roots": ["/data"], "poll_interval_ms": 250,
+///    "backend": "auto",
 ///    "ignore": ["*.tmp", ".git/**"],
 ///    "max_queue": 4096, "max_cache_entries": 256}
 ///
@@ -135,7 +179,7 @@ pub fn parse_config(text: &str) -> WaResult<Config> {
     for (key, _) in obj {
         if !matches!(
             key.as_str(),
-            "roots" | "poll_interval_ms" | "ignore" | "max_queue" | "max_cache_entries"
+            "roots" | "poll_interval_ms" | "backend" | "ignore" | "max_queue" | "max_cache_entries"
         ) {
             return Err((ERR_PARSE, format!("unknown config key \"{key}\"")));
         }
@@ -206,12 +250,35 @@ pub fn parse_config(text: &str) -> WaResult<Config> {
         }
     };
     let poll_interval_ms = parse_u64_opt(&value, "poll_interval_ms", DEFAULT_POLL_INTERVAL_MS)?;
+    let backend = match value.get("backend") {
+        None => Backend::Auto,
+        Some(json::Value::Str(s)) => match s.as_str() {
+            "auto" => Backend::Auto,
+            "native" => Backend::Native,
+            "polling" => Backend::Polling,
+            other => {
+                return Err((
+                    ERR_INVALID_ARG,
+                    format!(
+                        "\"backend\" must be \"auto\", \"native\" or \"polling\", got \"{other}\""
+                    ),
+                ))
+            }
+        },
+        Some(other) => {
+            return Err((
+                ERR_INVALID_ARG,
+                format!("\"backend\" must be a string, got {}", other.type_name()),
+            ))
+        }
+    };
     let max_queue = parse_usize_opt(&value, "max_queue", DEFAULT_MAX_QUEUE, 1)?;
     let max_cache_entries =
         parse_usize_opt(&value, "max_cache_entries", DEFAULT_MAX_CACHE_ENTRIES, 0)?;
     Ok(Config {
         roots,
         poll_interval_ms,
+        backend,
         ignore,
         max_queue,
         max_cache_entries,
@@ -665,7 +732,7 @@ pub struct SnapshotEntry {
 
 pub type Snapshot = std::collections::BTreeMap<String, SnapshotEntry>;
 
-fn mtime_nanos_of(md: &std::fs::Metadata) -> u128 {
+pub(crate) fn mtime_nanos_of(md: &std::fs::Metadata) -> u128 {
     match md.modified() {
         Ok(t) => t
             .duration_since(std::time::UNIX_EPOCH)
@@ -679,8 +746,16 @@ fn mtime_nanos_of(md: &std::fs::Metadata) -> u128 {
 /// skipped; an unreadable root contributes nothing for
 /// this scan (documented: it reads as empty).
 pub fn build_snapshot(config: &Config) -> Snapshot {
+    build_snapshot_of(config, &config.roots)
+}
+
+/// Build a snapshot of the given roots only (same rules
+/// as `build_snapshot`). The native backend's overflow
+/// rescan uses this to redo one root without walking the
+/// others.
+pub fn build_snapshot_of(config: &Config, roots: &[String]) -> Snapshot {
     let mut map = Snapshot::new();
-    for root in &config.roots {
+    for root in roots {
         let root_path = std::path::Path::new(root);
         collect(root_path, root_path, &config.ignore, &mut map);
     }
@@ -809,6 +884,75 @@ pub fn diff_snapshots(old: &Snapshot, new: &Snapshot) -> Vec<RawEvent> {
     raws
 }
 
+/// Merge a batch of *observed* named changes into
+/// `snapshot`, returning the raw events the batch stands
+/// for. This is the convergence point between the polling
+/// engine and the native backend: the caller (the
+/// `ReadDirectoryChangesW` thread) stats each path the OS
+/// named and reports `(full_path, Some(entry))` when it
+/// exists now or `(full_path, None)` when it is gone —
+/// which is exactly how the actions map: ADDED and
+/// RENAMED_NEW_NAME stat to an entry (upsert), REMOVED and
+/// RENAMED_OLD_NAME stat to nothing (removal), MODIFIED
+/// stats to its fresh entry (upsert). Duplicate paths in
+/// one batch fold last-wins before diffing.
+///
+/// The events come from running the ordinary snapshot
+/// diff over just the affected subset, so rename pairing,
+/// directory rules and event shapes are the poller's —
+/// including pairing a RENAMED_OLD + RENAMED_NEW pair that
+/// lands in one batch into a single `renamed` event.
+/// Removing a directory also removes every snapshot entry
+/// under it (each surfaces as its own `deleted`, exactly
+/// as a polling diff of the same change would report).
+/// Pure: no I/O, no locks — unit-tested on every platform.
+pub fn merge_observed_into_snapshot(
+    snapshot: &mut Snapshot,
+    observed: &[(String, Option<SnapshotEntry>)],
+) -> Vec<RawEvent> {
+    // Fold duplicates: the last observation of a path is
+    // the state the batch leaves it in.
+    let mut folded: std::collections::BTreeMap<&str, Option<SnapshotEntry>> =
+        std::collections::BTreeMap::new();
+    for (path, entry) in observed {
+        folded.insert(path.as_str(), *entry);
+    }
+    if folded.is_empty() {
+        return Vec::new();
+    }
+    // The "before" picture: the folded paths themselves,
+    // plus — when a directory disappears or turns into a
+    // file — every entry that lived under it.
+    let mut old_sub: Snapshot = Snapshot::new();
+    for (path, new_entry) in &folded {
+        if let Some(old) = snapshot.get(*path) {
+            old_sub.insert((*path).to_string(), *old);
+            let dir_vanishes = old.is_dir && new_entry.map(|e| !e.is_dir).unwrap_or(true);
+            if dir_vanishes {
+                for key in snapshot.keys() {
+                    if key.as_str() != *path && at_or_under(key, path) {
+                        old_sub.insert(key.clone(), snapshot[key]);
+                    }
+                }
+            }
+        }
+    }
+    let mut new_sub: Snapshot = Snapshot::new();
+    for (path, entry) in &folded {
+        if let Some(e) = entry {
+            new_sub.insert((*path).to_string(), *e);
+        }
+    }
+    let raws = diff_snapshots(&old_sub, &new_sub);
+    for key in old_sub.keys() {
+        snapshot.remove(key);
+    }
+    for (key, entry) in new_sub {
+        snapshot.insert(key, entry);
+    }
+    raws
+}
+
 // ---------------------------------------------------------------------------
 // Filesystem walks for the cache coordinator
 // ---------------------------------------------------------------------------
@@ -896,14 +1040,46 @@ struct State {
     shutdown: bool,
 }
 
-struct Inner {
-    config: Config,
-    state: std::sync::Mutex<State>,
-    changed: std::sync::Condvar,
+pub(crate) struct Inner {
+    pub(crate) config: Config,
+    pub(crate) state: std::sync::Mutex<State>,
+    pub(crate) changed: std::sync::Condvar,
     /// Serializes whole scans (walk + diff + merge) so a
     /// background scan and a manual `scan_once` can never
     /// apply snapshots out of order.
-    scan_lock: std::sync::Mutex<()>,
+    pub(crate) scan_lock: std::sync::Mutex<()>,
+    /// The backend actually running, as a `RunningBackend`
+    /// discriminant (0 = polling, 1 = native). Atomic so
+    /// the native thread's failure takeover can flip it to
+    /// polling — and be reported honestly — without taking
+    /// locks in a delicate order.
+    pub(crate) backend: std::sync::atomic::AtomicU8,
+    /// The polling thread's join handle when polling is
+    /// the background driver: spawned at create time, or
+    /// later by the native thread if the native backend
+    /// dies unexpectedly (the takeover path). The native
+    /// thread's own handle lives in the `Watcher`.
+    pub(crate) bg: std::sync::Mutex<Option<std::thread::JoinHandle<()>>>,
+}
+
+const BACKEND_POLLING: u8 = 0;
+const BACKEND_NATIVE: u8 = 1;
+
+/// The backend this watcher is actually running right now.
+pub(crate) fn running_backend(inner: &Inner) -> RunningBackend {
+    if inner.backend.load(std::sync::atomic::Ordering::SeqCst) == BACKEND_NATIVE {
+        RunningBackend::Native
+    } else {
+        RunningBackend::Polling
+    }
+}
+
+pub(crate) fn set_running_backend(inner: &Inner, backend: RunningBackend) {
+    let v = match backend {
+        RunningBackend::Polling => BACKEND_POLLING,
+        RunningBackend::Native => BACKEND_NATIVE,
+    };
+    inner.backend.store(v, std::sync::atomic::Ordering::SeqCst);
 }
 
 /// What one scan observed.
@@ -915,12 +1091,16 @@ pub struct ScanSummary {
 
 /// The watcher handle (`WaWatcher` in the header). All
 /// state is serialized inside; every method is safe to
-/// call from any thread. The background polling thread
-/// (when `poll_interval_ms > 0`) is owned by the handle
-/// and joined by `shutdown` (`wa_close`).
+/// call from any thread. The background thread — polling
+/// or native — (when `poll_interval_ms > 0`) is owned by
+/// the handle and joined by `shutdown` (`wa_close`).
 pub struct Watcher {
     inner: std::sync::Arc<Inner>,
-    thread: std::sync::Mutex<Option<std::thread::JoinHandle<()>>>,
+    /// The native backend's stop handle + thread (Windows
+    /// only; always empty elsewhere). The polling thread's
+    /// handle lives in `Inner::bg` so the native thread's
+    /// failure takeover can install one too.
+    native: std::sync::Mutex<Option<platform::NativeHandle>>,
 }
 
 impl Watcher {
@@ -929,6 +1109,15 @@ impl Watcher {
     /// baseline is the starting state, not a burst of
     /// creations), and start the background thread when
     /// the interval is non-zero.
+    ///
+    /// Backend selection is honest: `poll_interval_ms: 0`
+    /// is manual mode — no background discovery at all,
+    /// and the running backend is polling (driven by
+    /// `scan_once`). Otherwise `polling` runs the polling
+    /// thread; `auto`/`native` try the native backend on
+    /// Windows and fall back to the polling thread when it
+    /// cannot start (and report polling — see
+    /// `running_backend`).
     pub fn create(config: Config) -> WaResult<std::sync::Arc<Watcher>> {
         for root in &config.roots {
             let p = std::path::Path::new(root);
@@ -962,29 +1151,33 @@ impl Watcher {
             }),
             changed: std::sync::Condvar::new(),
             scan_lock: std::sync::Mutex::new(()),
+            backend: std::sync::atomic::AtomicU8::new(BACKEND_POLLING),
+            bg: std::sync::Mutex::new(None),
         });
         let watcher = std::sync::Arc::new(Watcher {
             inner: inner.clone(),
-            thread: std::sync::Mutex::new(None),
+            native: std::sync::Mutex::new(None),
         });
         let interval = inner.config.poll_interval_ms;
         if interval > 0 {
-            let bg = inner.clone();
-            let handle = std::thread::spawn(move || loop {
-                let stop = {
-                    let g = lock(&bg.state);
-                    let (g2, _) = bg
-                        .changed
-                        .wait_timeout(g, std::time::Duration::from_millis(interval))
-                        .unwrap_or_else(|e| e.into_inner());
-                    g2.shutdown
-                };
-                if stop {
-                    break;
+            let want_native = matches!(inner.config.backend, Backend::Auto | Backend::Native);
+            let mut started_native = false;
+            if want_native {
+                // On Windows this opens every root and
+                // spawns the ReadDirectoryChangesW thread;
+                // anywhere else (or when startup fails) it
+                // returns None and polling takes over — and
+                // the backend flag stays "polling", so the
+                // fallback is reported, never hidden.
+                if let Some(handle) = platform::try_start_native(inner.clone()) {
+                    set_running_backend(&inner, RunningBackend::Native);
+                    *lock(&watcher.native) = Some(handle);
+                    started_native = true;
                 }
-                do_scan(&bg);
-            });
-            *lock(&watcher.thread) = Some(handle);
+            }
+            if !started_native {
+                spawn_polling(&inner);
+            }
         }
         Ok(watcher)
     }
@@ -1139,6 +1332,7 @@ impl Watcher {
         Status {
             roots: self.inner.config.roots.clone(),
             poll_interval_ms: self.inner.config.poll_interval_ms,
+            backend: running_backend(&self.inner),
             files_tracked: g.snapshot.len(),
             events_emitted: g.events_emitted,
             queue_len: g.pending.len(),
@@ -1152,20 +1346,82 @@ impl Watcher {
         }
     }
 
-    /// Signal the background thread and join it. Never
-    /// returns while the thread is alive; a second call
-    /// (or a call on a manual-mode watcher) is a no-op.
+    /// Signal the background thread(s) and join them.
+    /// Never returns while a thread it owns is alive; a
+    /// second call (or a call on a manual-mode watcher) is
+    /// a no-op.
     pub fn shutdown(&self) {
         {
             let mut g = lock(&self.inner.state);
             g.shutdown = true;
         }
         self.inner.changed.notify_all();
-        let handle = lock(&self.thread).take();
+        // Native first: SetEvent wakes its wait instantly,
+        // and joining it before the polling handle matters
+        // because a dying native thread may install the
+        // polling takeover handle it must be joined through.
+        if let Some(mut h) = lock(&self.native).take() {
+            h.stop_and_join();
+        }
+        let handle = lock(&self.inner.bg).take();
         if let Some(h) = handle {
             let _ = h.join();
         }
     }
+}
+
+/// The polling background loop: wait one interval (or
+/// until notified), scan, repeat until shutdown. Runs on
+/// the create-time polling thread and on the native
+/// thread's failure-takeover thread alike.
+fn polling_loop(inner: std::sync::Arc<Inner>) {
+    let interval = inner.config.poll_interval_ms;
+    loop {
+        let stop = {
+            let g = lock(&inner.state);
+            let (g2, _) = inner
+                .changed
+                .wait_timeout(g, std::time::Duration::from_millis(interval))
+                .unwrap_or_else(|e| e.into_inner());
+            g2.shutdown
+        };
+        if stop {
+            break;
+        }
+        do_scan(&inner);
+    }
+}
+
+/// Spawn the polling thread (if none is running) and
+/// record its handle for `shutdown` to join. Used at
+/// create time and by the native backend's failure
+/// takeover; the second caller finds the slot taken and
+/// does nothing.
+pub(crate) fn spawn_polling(inner: &std::sync::Arc<Inner>) {
+    let mut slot = lock(&inner.bg);
+    if slot.is_some() {
+        return;
+    }
+    let bg = inner.clone();
+    *slot = Some(std::thread::spawn(move || polling_loop(bg)));
+}
+
+/// The native thread's last act when it dies
+/// unexpectedly: discovery must not silently stop, and
+/// the status must not keep claiming "native". Unless
+/// the watcher is already shutting down (then `shutdown`
+/// owns every thread), flip the reported backend to
+/// polling and install the polling thread as the driver.
+/// Called by `src/platform.rs` only — which is why host
+/// (non-Windows) builds see it as unused.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn native_failed_takeover(inner: &std::sync::Arc<Inner>) {
+    let shutting_down = lock(&inner.state).shutdown;
+    if shutting_down {
+        return;
+    }
+    set_running_backend(inner, RunningBackend::Polling);
+    spawn_polling(inner);
 }
 
 impl Drop for Watcher {
@@ -1177,6 +1433,46 @@ impl Drop for Watcher {
     }
 }
 
+/// The shared tail of every change path: invalidate the
+/// cache entries the raw events touch (at scan/apply
+/// time, never poll time), bump the cache epoch, and
+/// coalesce the events into the pending queue. Polling
+/// scans, per-root rescans, and native-backend batches
+/// all converge here, so the contracts live in exactly
+/// one place.
+fn apply_raw_events(inner: &Inner, g: &mut State, raws: &[RawEvent]) {
+    if raws.is_empty() {
+        return;
+    }
+    g.cache_epoch += 1;
+    for raw in raws {
+        let removed = g.cache.invalidate_for(&raw.path, raw.old_path.as_deref());
+        g.invalidations += removed as u64;
+    }
+    // Split the state's fields so merge_one can hold
+    // its borrows without fighting the borrow checker.
+    let mut dropped = g.dropped;
+    let State {
+        pending,
+        next_seq,
+        events_emitted,
+        ..
+    } = &mut *g;
+    for raw in raws {
+        merge_one(
+            pending,
+            raw,
+            next_seq,
+            events_emitted,
+            inner.config.max_queue,
+            &mut dropped,
+        );
+    }
+    // The field borrows above have ended (NLL), so the
+    // accumulated drop count can be written back.
+    g.dropped = dropped;
+}
+
 fn do_scan(inner: &Inner) -> ScanSummary {
     let _serialized = lock(&inner.scan_lock);
     let new_snapshot = build_snapshot(&inner.config);
@@ -1185,39 +1481,65 @@ fn do_scan(inner: &Inner) -> ScanSummary {
     let raw_count = raws.len();
     g.snapshot = new_snapshot;
     g.scans += 1;
-    if !raws.is_empty() {
-        g.cache_epoch += 1;
-        for raw in &raws {
-            let removed = g.cache.invalidate_for(&raw.path, raw.old_path.as_deref());
-            g.invalidations += removed as u64;
-        }
-        // Split the state's fields so merge_one can hold
-        // its borrows without fighting the borrow checker.
-        let mut dropped = g.dropped;
-        let State {
-            pending,
-            next_seq,
-            events_emitted,
-            ..
-        } = &mut *g;
-        for raw in &raws {
-            merge_one(
-                pending,
-                raw,
-                next_seq,
-                events_emitted,
-                inner.config.max_queue,
-                &mut dropped,
-            );
-        }
-        // The field borrows above have ended (NLL), so the
-        // accumulated drop count can be written back.
-        g.dropped = dropped;
-    }
+    apply_raw_events(inner, &mut g, &raws);
     ScanSummary {
         files_tracked: g.snapshot.len(),
         raw_events: raw_count,
     }
+}
+
+/// Rebuild one root's snapshot from disk and diff it
+/// against the recorded state (the rest of the snapshot
+/// is untouched). The native backend runs this when the
+/// OS change buffer overflows: whatever was lost is
+/// rediscovered by the ordinary polling machinery, so an
+/// overflow degrades to one root walk, never to silently
+/// missed changes. Counts as a scan in `wa_status`.
+/// (Called from the Windows backend and from tests.)
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn do_root_rescan(inner: &Inner, root: &str) -> ScanSummary {
+    let _serialized = lock(&inner.scan_lock);
+    let roots = [root.to_string()];
+    let fresh = build_snapshot_of(&inner.config, &roots);
+    let mut g = lock(&inner.state);
+    let mut old_sub: Snapshot = Snapshot::new();
+    for key in g.snapshot.keys() {
+        if at_or_under(key, root) {
+            old_sub.insert(key.clone(), g.snapshot[key]);
+        }
+    }
+    let raws = diff_snapshots(&old_sub, &fresh);
+    let raw_count = raws.len();
+    for key in old_sub.keys() {
+        g.snapshot.remove(key);
+    }
+    for (key, entry) in fresh {
+        g.snapshot.insert(key, entry);
+    }
+    g.scans += 1;
+    apply_raw_events(inner, &mut g, &raws);
+    ScanSummary {
+        files_tracked: g.snapshot.len(),
+        raw_events: raw_count,
+    }
+}
+
+/// Apply one batch of OS-named changes (already statted
+/// by the caller into `merge_observed_into_snapshot`'s
+/// input shape) through the shared pipeline. Serialized
+/// with scans on the scan lock so a native batch can
+/// never interleave with a walk+diff halfway. A batch is
+/// not a scan — `scans` does not move.
+/// (Called from the Windows backend and from tests.)
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn apply_observed_changes(inner: &Inner, observed: &[(String, Option<SnapshotEntry>)]) {
+    if observed.is_empty() {
+        return;
+    }
+    let _serialized = lock(&inner.scan_lock);
+    let mut g = lock(&inner.state);
+    let raws = merge_observed_into_snapshot(&mut g.snapshot, observed);
+    apply_raw_events(inner, &mut g, &raws);
 }
 
 // ---------------------------------------------------------------------------
@@ -1299,6 +1621,9 @@ impl SearchResult {
 pub struct Status {
     pub roots: Vec<String>,
     pub poll_interval_ms: u64,
+    /// The backend actually running (never just the one
+    /// the config requested).
+    pub backend: RunningBackend,
     pub files_tracked: usize,
     /// Distinct events ever queued (sequence numbers
     /// handed out). Coalesced merges do not add to it; a
@@ -1323,9 +1648,10 @@ impl Status {
             .map(|r| format!("\"{}\"", json_escape(r)))
             .collect();
         format!(
-            "{{\"roots\":[{}],\"poll_interval_ms\":{},\"files_tracked\":{},\"events_emitted\":{},\"queue_len\":{},\"dropped\":{},\"next_seq\":{},\"scans\":{},\"cache_entries\":{},\"cache_hits\":{},\"cache_misses\":{},\"invalidations\":{}}}",
+            "{{\"roots\":[{}],\"poll_interval_ms\":{},\"backend\":\"{}\",\"files_tracked\":{},\"events_emitted\":{},\"queue_len\":{},\"dropped\":{},\"next_seq\":{},\"scans\":{},\"cache_entries\":{},\"cache_hits\":{},\"cache_misses\":{},\"invalidations\":{}}}",
             roots.join(","),
             self.poll_interval_ms,
+            self.backend.as_str(),
             self.files_tracked,
             self.events_emitted,
             self.queue_len,
@@ -1471,6 +1797,195 @@ mod tests {
             .0,
             ERR_INVALID_ARG
         );
+    }
+
+    #[test]
+    fn config_backend_key() {
+        let d = TestDir::new("backend");
+        let root = json_escape(&d.s());
+        // Absent = auto; each documented value parses.
+        let def = parse_config(&format!("{{\"roots\":[\"{root}\"]}}")).unwrap();
+        assert_eq!(def.backend, Backend::Auto);
+        for (text, want) in [
+            ("auto", Backend::Auto),
+            ("native", Backend::Native),
+            ("polling", Backend::Polling),
+        ] {
+            let c = parse_config(&format!(
+                "{{\"roots\":[\"{root}\"],\"backend\":\"{text}\"}}"
+            ))
+            .unwrap();
+            assert_eq!(c.backend, want);
+        }
+        // Invalid values follow the family convention for
+        // wrong-typed / out-of-range values: INVALID_ARG.
+        assert_eq!(
+            parse_config(&format!("{{\"roots\":[\"{root}\"],\"backend\":\"fast\"}}"))
+                .unwrap_err()
+                .0,
+            ERR_INVALID_ARG
+        );
+        assert_eq!(
+            parse_config(&format!("{{\"roots\":[\"{root}\"],\"backend\":3}}"))
+                .unwrap_err()
+                .0,
+            ERR_INVALID_ARG
+        );
+    }
+
+    #[test]
+    fn backend_manual_mode_reports_polling() {
+        // Even with "native" requested, poll_interval_ms 0
+        // is manual mode: no background discovery exists,
+        // scan_once (the poller) is the driver, and the
+        // status says polling — on every platform.
+        let d = TestDir::new("backend-manual");
+        let cfg = parse_config(&format!(
+            "{{\"roots\":[\"{}\"],\"poll_interval_ms\":0,\"backend\":\"native\"}}",
+            json_escape(&d.s())
+        ))
+        .unwrap();
+        let w = Watcher::create(cfg).unwrap();
+        assert_eq!(w.status().backend, RunningBackend::Polling);
+        assert!(w.status().to_json().contains("\"backend\":\"polling\""));
+    }
+
+    fn snap_entry(size: u64, mtime: u128, is_dir: bool) -> SnapshotEntry {
+        SnapshotEntry {
+            size,
+            mtime_nanos: mtime,
+            is_dir,
+        }
+    }
+
+    #[test]
+    fn merge_observed_upsert_modify_remove() {
+        let mut snap: Snapshot = Snapshot::new();
+        snap.insert("/r/a.txt".to_string(), snap_entry(5, 100, false));
+        let raws = merge_observed_into_snapshot(
+            &mut snap,
+            &[
+                ("/r/a.txt".to_string(), Some(snap_entry(7, 200, false))),
+                ("/r/b.txt".to_string(), Some(snap_entry(3, 300, false))),
+                // A removal for a path never tracked is a
+                // no-op (the native net-zero case).
+                ("/r/never.txt".to_string(), None),
+            ],
+        );
+        assert_eq!(raws.len(), 2);
+        assert!(raws
+            .iter()
+            .any(|r| r.kind == EventKind::Modified && r.path == "/r/a.txt"));
+        assert!(raws
+            .iter()
+            .any(|r| r.kind == EventKind::Created && r.path == "/r/b.txt"));
+        assert_eq!(snap["/r/a.txt"], snap_entry(7, 200, false));
+        assert_eq!(snap["/r/b.txt"], snap_entry(3, 300, false));
+    }
+
+    #[test]
+    fn merge_observed_pairs_rename_and_removes_dir_subtree() {
+        let mut snap: Snapshot = Snapshot::new();
+        snap.insert("/r/old.txt".to_string(), snap_entry(5, 100, false));
+        snap.insert("/r/d".to_string(), snap_entry(0, 50, true));
+        snap.insert("/r/d/x.txt".to_string(), snap_entry(1, 60, false));
+        snap.insert("/r/keep.txt".to_string(), snap_entry(2, 70, false));
+        // RENAMED_OLD + RENAMED_NEW in one batch pair into
+        // a single renamed event, exactly as a polling
+        // diff of the same change pairs them.
+        let raws = merge_observed_into_snapshot(
+            &mut snap,
+            &[
+                ("/r/old.txt".to_string(), None),
+                ("/r/new.txt".to_string(), Some(snap_entry(5, 100, false))),
+            ],
+        );
+        assert_eq!(raws.len(), 1);
+        assert_eq!(raws[0].kind, EventKind::Renamed);
+        assert_eq!(raws[0].path, "/r/new.txt");
+        assert_eq!(raws[0].old_path.as_deref(), Some("/r/old.txt"));
+        // Removing a directory removes its whole subtree
+        // from the snapshot, one deleted event per entry.
+        let raws = merge_observed_into_snapshot(&mut snap, &[("/r/d".to_string(), None)]);
+        assert_eq!(raws.len(), 2);
+        assert!(raws.iter().all(|r| r.kind == EventKind::Deleted));
+        assert!(!snap.contains_key("/r/d"));
+        assert!(!snap.contains_key("/r/d/x.txt"));
+        assert!(snap.contains_key("/r/keep.txt"));
+        assert!(snap.contains_key("/r/new.txt"));
+    }
+
+    #[test]
+    fn merge_observed_folds_duplicates_last_wins() {
+        let mut snap: Snapshot = Snapshot::new();
+        // Added and removed inside one batch, path never
+        // tracked: folds to a removal of nothing = silence.
+        let raws = merge_observed_into_snapshot(
+            &mut snap,
+            &[
+                ("/r/t.txt".to_string(), Some(snap_entry(1, 1, false))),
+                ("/r/t.txt".to_string(), None),
+            ],
+        );
+        assert!(raws.is_empty());
+        assert!(snap.is_empty());
+        // Removed and re-added with identical state in one
+        // batch: no diff, no event.
+        snap.insert("/r/t.txt".to_string(), snap_entry(1, 1, false));
+        let raws = merge_observed_into_snapshot(
+            &mut snap,
+            &[
+                ("/r/t.txt".to_string(), None),
+                ("/r/t.txt".to_string(), Some(snap_entry(1, 1, false))),
+            ],
+        );
+        assert!(raws.is_empty());
+        assert_eq!(snap["/r/t.txt"], snap_entry(1, 1, false));
+    }
+
+    #[test]
+    fn root_rescan_applies_one_roots_diff() {
+        let d = TestDir::new("rescan");
+        write(&d.join("a.txt"), b"aaa");
+        let w = Watcher::create(manual_config(&d)).unwrap();
+        write(&d.join("b.txt"), b"b");
+        std::fs::remove_file(d.join("a.txt")).unwrap();
+        // A rescan of the root (the native overflow path)
+        // produces exactly the events a full scan would,
+        // and counts as a scan.
+        let summary = do_root_rescan(&w.inner, &d.s());
+        assert_eq!(summary.raw_events, 2);
+        assert_eq!(w.status().scans, 1);
+        let poll = w.poll_events(0, 0);
+        let mut kinds: Vec<&str> = poll.events.iter().map(|e| e.kind.as_str()).collect();
+        kinds.sort_unstable();
+        assert_eq!(kinds, vec!["created", "deleted"]);
+    }
+
+    #[test]
+    fn apply_observed_changes_feeds_the_shared_pipeline() {
+        let d = TestDir::new("observed");
+        let w = Watcher::create(manual_config(&d)).unwrap();
+        // Cache the (empty) root's folder size first, so
+        // the batch's invalidation is observable.
+        let _ = w.folder_size(&d.s()).unwrap();
+        write(&d.join("new.txt"), b"data");
+        let md = std::fs::symlink_metadata(d.join("new.txt")).unwrap();
+        let entry = SnapshotEntry {
+            size: md.len(),
+            mtime_nanos: mtime_nanos_of(&md),
+            is_dir: false,
+        };
+        apply_observed_changes(&w.inner, &[(d.file("new.txt"), Some(entry))]);
+        let poll = w.poll_events(0, 0);
+        assert_eq!(poll.events.len(), 1);
+        assert_eq!(poll.events[0].kind, EventKind::Created);
+        let st = w.status();
+        assert_eq!(st.files_tracked, 1);
+        // Invalidation happened through the shared
+        // scan-time rule, and a batch is not a scan.
+        assert_eq!(st.invalidations, 1);
+        assert_eq!(st.scans, 0);
     }
 
     #[test]

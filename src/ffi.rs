@@ -114,7 +114,7 @@ fn json_call<F: FnOnce(&Watcher) -> WaResult<String>>(
 
 #[no_mangle]
 pub extern "C" fn wa_version() -> *const c_char {
-    static VERSION_C: &[u8] = b"0.1.0\0";
+    static VERSION_C: &[u8] = b"0.2.0\0";
     VERSION_C.as_ptr() as *const c_char
 }
 
@@ -330,6 +330,9 @@ mod tests {
         let st = call_json(|out| wa_status(w, out));
         assert_eq!(st.get("files_tracked").unwrap().as_i64(), Some(1));
         assert_eq!(st.get("events_emitted").unwrap().as_i64(), Some(1));
+        // Manual mode (poll_interval_ms 0) is the polling
+        // driver on every platform — reported as such.
+        assert_eq!(st.get("backend").unwrap().as_str(), Some("polling"));
         let root = cs(&d.s());
         let size = call_json(|out| wa_folder_size(w, root.as_ptr(), out));
         assert_eq!(size.get("total_bytes").unwrap().as_i64(), Some(5));
