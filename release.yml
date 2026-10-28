@@ -1,0 +1,32 @@
+# Release workflow — builds the x64 DLL package and attaches it to
+# the GitHub Release for the pushed version tag. The release itself
+# (tag + notes) is created in the GitHub web UI; this workflow only
+# builds and uploads the zip. Binaries are unsigned.
+name: release
+on:
+  push:
+    tags: ["v*"]
+jobs:
+  release:
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --release --locked
+      - name: Package x64 DLL zip
+        shell: pwsh
+        run: |
+          $ver = "${{ github.ref_name }}"
+          $stage = "dist/WatchKit-$ver-x64"
+          New-Item -ItemType Directory -Force $stage | Out-Null
+          Copy-Item "target/release/watch_kit.dll" $stage
+          Copy-Item "target/release/watch_kit.dll.lib" $stage
+          Copy-Item "include/watchkit.h" $stage
+          Copy-Item LICENSE $stage
+          Copy-Item README.md $stage
+          Compress-Archive -Path "$stage/*" -DestinationPath "dist/WatchKit-$ver-x64.zip"
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.zip
