@@ -1,12 +1,12 @@
 # Parity / Capability Matrix — WatchKit
 
-Updated: 2026-10-28 · Overall readiness: v0.1.0 complete locally — full gate green (see QUALITY.md); Windows runtime evidence is CI's real MSVC build plus a future on-machine field pass (Partially Verified).
+Updated: 2026-10-28 · Overall readiness: v0.2.0 complete locally — full gate green (see QUALITY.md); Windows runtime evidence is CI's real MSVC build plus a future on-machine field pass (Partially Verified). The native backend's parser and snapshot-merge are unit-tested locally; its `ReadDirectoryChangesW` runtime path is Unverified until a field test on a real Windows machine.
 
 A row may say **Complete** only with a passing test or field result named in Evidence.
 
 | Area | Target | State | Evidence (test / corpus) | Gap |
 |---|---|---|---|---|
-| Config | JSON config: roots (required), poll interval, ignore globs, queue/cache bounds; unknown + duplicate keys rejected | Complete | `config_parse_rules` (defaults, unknown/duplicate = parse error, type/range errors) + FFI error test | — |
+| Config | JSON config: roots (required), poll interval, backend key, ignore globs, queue/cache bounds; unknown + duplicate keys rejected | Complete | `config_parse_rules` (defaults, unknown/duplicate = parse error, type/range errors), `config_backend_key` (auto/native/polling, invalid = INVALID_ARG) + FFI error test | — |
 | Baseline snapshot | Pre-existing files emit no events | Complete | `baseline_emits_no_events` | — |
 | Detection | Created / modified / deleted via snapshot diff (size + mtime) | Complete | `create_modify_delete_detection` (incl. subdirectory events) | Same-size edit inside one mtime tick can be missed — documented limit, not a gap to close silently |
 | Background polling | Thread polls at the configured interval; manual mode at interval 0 | Complete | `background_thread_picks_up_changes_and_close_joins` (bounded outcome wait) | — |
@@ -21,6 +21,6 @@ A row may say **Complete** only with a passing test or field result named in Evi
 | Search cache | Case-insensitive substring matches, cached, invalidated like sizes | Complete | `search_cache_and_invalidation` | — |
 | Cache bound | One shared LRU cache; `max_cache_entries` 0 disables | Complete | `cache_lru_eviction_at_bound`, `cache_zero_entries_disables_caching` | — |
 | Multiple roots | Several recursive roots in one watcher | Complete | `multiple_roots` | — |
-| Lifecycle | `wa_close` joins the polling thread; double close safe; Rust `Drop` also shuts down | Complete | `background_thread_picks_up_changes_and_close_joins` | — |
+| Lifecycle | `wa_close` joins the background thread (polling or native); double close safe; Rust `Drop` also shuts down | Complete (polling); native join path Unverified at runtime | `background_thread_picks_up_changes_and_close_joins` | Native close drains overlapped I/O before closing handles — code-reviewed and Windows-target checked, not yet run on Windows |
 | FFI surface | Every header export exercised; null/malformed inputs return documented codes | Complete | `ffi_end_to_end`, `ffi_config_and_handle_errors` | Windows MSVC link verified by CI, not locally |
-| Native change backend | `ReadDirectoryChangesW` feeding the same contracts | Not started | — | ROADMAP item 1; polling is the shipped v0.1 backend |
+| Native change backend | `ReadDirectoryChangesW` feeding the same contracts; `"backend"` config key; status reports the running backend; overflow/malformed completion rescans that root; startup or runtime failure falls back to polling and reports polling | Partially Verified | Parser: `parses_a_single_record`, `parses_a_multi_record_chain`, `zero_length_name_is_skipped_not_fatal`, `truncated_final_record_is_an_error`, `truncated_header_is_an_error`, `next_offset_past_the_buffer_is_an_error`, `unknown_action_is_an_error`, `backslashes_become_slashes`, `empty_buffer_is_no_changes`. Convergence: `merge_observed_upsert_modify_remove`, `merge_observed_pairs_rename_and_removes_dir_subtree`, `merge_observed_folds_duplicates_last_wins`, `apply_observed_changes_feeds_the_shared_pipeline`, `root_rescan_applies_one_roots_diff`. Reporting/fallback: `backend_manual_mode_reports_polling`, `native_backend_is_unavailable_off_windows`, FFI status asserts `"backend":"polling"`. Windows-target clippy + check green in the local gate | The RDCW thread's runtime behaviour (event delivery, overflow completion shape, close-while-pending) has never run on a real Windows machine — field test still owed; CI's MSVC build is the link gate |
