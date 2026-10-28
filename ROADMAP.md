@@ -1,13 +1,15 @@
 # WatchKit Roadmap
 
-## v0.1.0 (current)
+## v0.2.0 (current)
+Everything in v0.1, plus the native change backend (former roadmap item 1): on Windows, one thread per watcher runs `ReadDirectoryChangesW` over every root and stats each OS-named path into the same snapshot/queue/cache pipeline the poller uses — the coalescing table, queue bounds, and invalidation rules are unchanged, and `wa_scan_once` still drives the polling diff synchronously. The config gains a `"backend"` key (`"auto"` default, `"native"`, `"polling"`); `wa_status` reports the backend actually running as `"backend"`. A native request that cannot start falls back to polling and reports polling; a buffer overflow (or a malformed completion) rescans just that root through the polling machinery; if the native thread dies unexpectedly it hands discovery to a polling thread and reports polling. Polling stays the portable fallback everywhere else and the test driver. The `FILE_NOTIFY_INFORMATION` parser and the snapshot-merge are pure functions, unit-tested on every platform; the Windows runtime path itself is Unverified until a field test on a real Windows machine.
+
+## v0.1.0
 The folder change and cache coordinator behind a C ABI: a portable polling snapshot-diff engine (size + mtime, no content hashing), a sequenced pending-event queue with the full coalescing table (net-zero create+delete, deleted+recreated = modified, rename chains collapsed), a bounded queue with counted — never silent — overflow drops, ignore globs with directory pruning, and a shared LRU cache for folder sizes and substring searches that the event stream invalidates at scan time. `wa_scan_once` drives scans synchronously; `wa_close` joins the polling thread.
 
 ## Next, in order
-1. **Native change backend (Windows `ReadDirectoryChangesW`)**: feed OS change notifications into the same snapshot/queue/cache pipeline so large trees stop paying a full walk per interval and latency drops below one poll interval. The coalescing table, queue bounds, and invalidation rules are frozen contracts — the backend replaces only how raw changes are discovered, and polling stays as the portable fallback (and the test driver).
-2. **Thumbnail-cache payload**: a third cache value kind holding opaque preview blobs keyed by path + size + mtime, so a host explorer's thumbnail pipeline uses the same invalidation and LRU bounds as sizes and searches instead of growing a parallel cache.
-3. **Overflow recovery hint**: when `dropped > 0`, consumers currently learn *that* events were lost but not *where*; add a per-root "resync recommended" marker to status so a host knows which tree to rescan rather than guessing.
-4. **Per-root pause/resume**: suspend scanning one root (a removable drive that went away) without tearing down the watcher or losing other roots' sequence continuity.
+1. **Thumbnail-cache payload**: a third cache value kind holding opaque preview blobs keyed by path + size + mtime, so a host explorer's thumbnail pipeline uses the same invalidation and LRU bounds as sizes and searches instead of growing a parallel cache.
+2. **Overflow recovery hint**: when `dropped > 0`, consumers currently learn *that* events were lost but not *where*; add a per-root "resync recommended" marker to status so a host knows which tree to rescan rather than guessing.
+3. **Per-root pause/resume**: suspend scanning one root (a removable drive that went away) without tearing down the watcher or losing other roots' sequence continuity.
 
 ## Explicitly not planned
 - Content hashing for change detection: it would make every scan read every byte of every watched file. Size + mtime, with its limit documented, is the honest trade at this layer; hosts that need certainty can hash the specific files events point at.
